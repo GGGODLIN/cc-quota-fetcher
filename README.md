@@ -4,7 +4,17 @@ Push claude.ai usage quota into local cache files for statusline / external cons
 
 ## Why
 
-`api.anthropic.com/api/oauth/usage` rate limits per-token (sliding window 5-30 min). For multi-account quota visibility on a statusline, polling oauth/usage hits 429 frequently. The web UI uses a different endpoint with a different throttle pool, but Cloudflare blocks plain CLI curl (TLS fingerprint). Solution: a Chrome extension fetches inside an already-authed browser, then a native messaging host writes the result to local cache files.
+The goal: a statusline showing live usage percentages for two Claude accounts side by side. The path to get there ruled out three simpler approaches before landing on a Chrome extension.
+
+**Approach 1 — Poll `/api/oauth/usage` from the shell.** Claude Code stores its OAuth bearer token in macOS keychain, so a shell script can read it and `curl` the endpoint. This works for one account at low frequency, but the endpoint enforces a per-token sliding-window rate limit (5–30 min cooling). Two accounts polling every 30s hits 429 quickly, and once you hit the limit your numbers go stale until the cooling window slides.
+
+**Approach 2 — Hit the web endpoint from the shell.** `claude.ai/api/organizations/<org>/usage` returns the same JSON schema with cookie auth, and lives in a separate, much looser throttle pool. Reading the session cookie out of Chrome's cookies database is a well-known recipe (PBKDF2 + AES-CBC with a key in the macOS keychain), so I tried that. Two problems killed it:
+- Chrome 147 (and likely earlier) on macOS no longer encrypts cookies with the old PBKDF2 + AES-CBC scheme. The `v10` prefix is still present but the inner format is different; existing decrypters output binary garbage. Reverse-engineering the new scheme to keep up with Chrome releases isn't worth the maintenance.
+- Even with the cookie in hand, Cloudflare blocks plain `curl` to `claude.ai`. It checks TLS JA3/JA4 fingerprints and HTTP/2 frame ordering, not just cookies. `cf_clearance` cookies are bound to the originating client fingerprint, so copying them out of Chrome doesn't transfer. `curl-impersonate` partially works but is in an arms race with Cloudflare's fingerprint database.
+
+**Approach 3 — Read what Chrome already fetched.** Chrome itself retrieves usage data when you visit `claude.ai/settings/usage`. If we let Chrome do the fetching (real client, real cookies, real fingerprints) and just consume the result locally, both problems disappear. This is what a Chrome extension plus native messaging is for.
+
+So: a small extension runs in each authed Chrome profile, fetches usage on a timer, and pipes the JSON through a native messaging host into `~/.claude/cache/`. A shell script reads the cache files and renders the statusline. Chrome handles auth and Cloudflare; the extension is ~80 lines; the receiver is stdlib Python. The main caveat is that Chrome must be running for the cache to stay fresh.
 
 ## Architecture
 
