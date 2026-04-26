@@ -1,0 +1,10 @@
+{
+  "name": "com.cc.quota_writer",
+  "description": "Receive claude.ai quota payload from cc-quota-fetcher extension",
+  "path": "__RECEIVER_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__EXTENSION_ID_1__/",
+    "chrome-extension://__EXTENSION_ID_2__/"
+  ]
+}

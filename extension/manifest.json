@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "CC Quota Fetcher",
+  "version": "0.1.0",
+  "description": "Fetch claude.ai usage quota and push to local cache via native messaging",
+  "permissions": [
+    "alarms",
+    "storage",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "https://claude.ai/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
