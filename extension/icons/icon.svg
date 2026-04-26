@@ -1,0 +1,31 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <title>CC Quota Fetcher</title>
+  <desc>Claude-orange chip with horizontal double-headed arrow (account switching) crossing through a centered 8-point sparkle (Claude / lookup). Source-of-truth for icon-{16,32,48,128}.png. Edit then run extension/icons/generate.py.</desc>
+
+  <!-- chip: warm Claude orange -->
+  <circle cx="64" cy="64" r="60" fill="#D97757"/>
+
+  <!-- double-headed arrow flanking the sparkle:
+       left arrow (← shaft from x=46 to x=18 + arrowhead tip at x=14)
+       right arrow (→ shaft from x=82 to x=110 + arrowhead tip at x=114) -->
+  <g fill="#F4F1E8">
+    <polygon points="14,64 26,57 26,61.5 46,61.5 46,66.5 26,66.5 26,71"/>
+    <polygon points="114,64 102,57 102,61.5 82,61.5 82,66.5 102,66.5 102,71"/>
+  </g>
+
+  <!-- 8-point sparkle, centered, sized to fit between the two arrowheads.
+       Long rays (cardinal) span ±20 from center, short rays (diagonal) span ±13. -->
+  <g fill="#F4F1E8">
+    <polygon points="64,44 65.4,62.6 64,64 62.6,62.6"/>
+    <polygon points="84,64 65.4,65.4 64,64 65.4,62.6"/>
+    <polygon points="64,84 62.6,65.4 64,64 65.4,65.4"/>
+    <polygon points="44,64 62.6,62.6 64,64 62.6,65.4"/>
+    <polygon points="73.2,54.8 65.0,63.0 64,64 63.0,63.0"/>
+    <polygon points="73.2,73.2 65.0,65.0 64,64 65.0,63.0"/>
+    <polygon points="54.8,73.2 63.0,65.0 64,64 65.0,65.0"/>
+    <polygon points="54.8,54.8 63.0,63.0 64,64 65.0,63.0"/>
+  </g>
+
+  <!-- center highlight -->
+  <circle cx="64" cy="64" r="3" fill="#FFFFFF"/>
+</svg>

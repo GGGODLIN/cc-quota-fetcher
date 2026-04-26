@@ -67,8 +67,8 @@ For each profile that should be tracked:
 3. Click **Load unpacked**, select the `extension/` directory
 4. Note the **extension ID** that Chrome assigns (32-char hex)
 
-> Optional: regenerate icons after editing `extension/icons/generate.py`:
-> `python3 extension/icons/generate.py` (requires Pillow). The committed PNGs are sufficient for normal use.
+> Optional: edit `extension/icons/icon.svg` (any vector tool — Inkscape, Figma export, hand-edited XML — works), then regenerate the PNGs:
+> `python3 extension/icons/generate.py` (requires `brew install librsvg`). The committed PNGs are sufficient for normal use.
 
 ### 2. Install the native messaging host
 
