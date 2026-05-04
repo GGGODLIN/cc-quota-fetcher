@@ -16,7 +16,8 @@
       "48": "icons/icon-48.png",
       "128": "icons/icon-128.png"
     },
-    "default_title": "CC Quota Fetcher"
+    "default_title": "CC Quota Fetcher",
+    "default_popup": "popup.html"
   },
   "permissions": [
     "alarms",
@@ -24,7 +25,9 @@
     "nativeMessaging"
   ],
   "host_permissions": [
-    "https://claude.ai/*"
+    "https://claude.ai/*",
+    "https://api.deepseek.com/*",
+    "https://platform.xiaomimimo.com/*"
   ],
   "background": {
     "service_worker": "background.js"

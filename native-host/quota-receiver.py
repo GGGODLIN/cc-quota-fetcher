@@ -59,6 +59,18 @@ def write_message(payload: dict) -> None:
     sys.stdout.buffer.flush()
 
 
+ACTIVE_PROFILE_FILE = CACHE_DIR / "vendor-active-profile"
+
+
+def update_active_profile(pid: str | None) -> None:
+    if not pid:
+        return
+    try:
+        ACTIVE_PROFILE_FILE.write_text(pid)
+    except Exception:
+        pass
+
+
 def handle(msg: dict) -> dict:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     msg_type = msg.get("type")
@@ -66,6 +78,7 @@ def handle(msg: dict) -> dict:
     safe = email_safe(email)
     cache = CACHE_DIR / f"quota-{safe}.json"
     status = CACHE_DIR / f"quota-{safe}.status"
+    pid = msg.get("profile_id")
 
     if msg_type == "quota":
         body = msg.get("body")
@@ -87,6 +100,48 @@ def handle(msg: dict) -> dict:
         reason = msg.get("reason") or "unknown"
         status.write_text(f"{ts}\t{reason}")
         return {"ok": True, "wrote": str(status)}
+
+    if msg_type in ("vendor-balance", "vendor-plan", "vendor-status"):
+        update_active_profile(pid)
+
+    if msg_type == "vendor-balance":
+        vendor = msg.get("vendor") or "unknown"
+        data = msg.get("data")
+        if not isinstance(data, dict):
+            return {"ok": False, "reason": "missing data"}
+        vcache = CACHE_DIR / f"vendor-{vendor}-{pid}.json"
+        vstatus = CACHE_DIR / f"vendor-{vendor}-{pid}.status"
+        vcache.write_text(json.dumps({"vendor": vendor, "profile_id": pid, "data": data}))
+        if vstatus.exists():
+            vstatus.unlink()
+        return {"ok": True, "wrote": str(vcache)}
+
+    if msg_type == "vendor-plan":
+        vendor = msg.get("vendor") or "unknown"
+        data = msg.get("data")
+        if not isinstance(data, dict):
+            return {"ok": False, "reason": "missing data"}
+        pcache = CACHE_DIR / f"vendor-{vendor}-plan-{pid}.json"
+        pcache.write_text(json.dumps({"vendor": vendor, "profile_id": pid, "data": data}))
+        return {"ok": True, "wrote": str(pcache)}
+
+    if msg_type == "vendor-status":
+        vendor = msg.get("vendor") or "unknown"
+        reason = msg.get("reason") or "unknown"
+        vstatus = CACHE_DIR / f"vendor-{vendor}-{pid}.status"
+        vstatus.write_text(f"{msg.get('fetched_at', '')}\t{reason}")
+        return {"ok": True, "wrote": str(vstatus)}
+
+    if msg_type == "vendor-clear":
+        vendor = msg.get("vendor") or "unknown"
+        removed = []
+        for f in CACHE_DIR.glob(f"vendor-{vendor}-*{pid}*.json"):
+            f.unlink()
+            removed.append(str(f))
+        for f in CACHE_DIR.glob(f"vendor-{vendor}-*{pid}*.status"):
+            f.unlink()
+            removed.append(str(f))
+        return {"ok": True, "removed": removed}
 
     return {"ok": False, "reason": f"unknown type {msg_type!r}"}
 
