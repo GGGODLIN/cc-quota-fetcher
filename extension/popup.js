@@ -23,6 +23,14 @@ const init = async () => {
       }
     });
   }
+
+  const keyInput = document.getElementById('ds-key');
+  const stored = await chrome.storage.local.get('deepseek_api_key');
+  keyInput.value = stored.deepseek_api_key ?? '';
+  keyInput.addEventListener('change', async () => {
+    await chrome.storage.local.set({ deepseek_api_key: keyInput.value.trim() });
+  });
+
   const profileId = (await chrome.storage.local.get('profile_id')).profile_id ?? '?';
   document.getElementById('status').textContent = `profile: ${profileId}`;
 };

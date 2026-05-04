@@ -2,7 +2,6 @@ const NATIVE_HOST = 'com.cc.quota_writer';
 const ALARM_NAME = 'cc-quota-fetch';
 const PERIOD_MINUTES = 0.5;
 
-const DEEPSEEK_API_KEY = 'REDACTED_DS_KEY_ROTATED_2026_06_19';
 const DEEPSEEK_BALANCE_URL = 'https://api.deepseek.com/user/balance';
 const MIMO_BALANCE_URL = 'https://platform.xiaomimimo.com/api/v1/balance';
 const MIMO_PLAN_URL = 'https://platform.xiaomimimo.com/api/v1/tokenPlan/usage';
@@ -29,6 +28,11 @@ const VENDOR_DEFAULTS = { deepseek: true, mimo: true };
 const getVendorConfig = async () => {
   const stored = await chrome.storage.local.get('vendor_enabled');
   return Object.assign({}, VENDOR_DEFAULTS, stored.vendor_enabled ?? {});
+};
+
+const getDeepSeekApiKey = async () => {
+  const stored = await chrome.storage.local.get('deepseek_api_key');
+  return stored.deepseek_api_key ?? '';
 };
 
 const send = (payload) => new Promise((resolve) => {
@@ -88,11 +92,13 @@ const fetchAnthropicQuota = async (pid) => {
 };
 
 const fetchDeepSeekBalance = async (pid) => {
+  const apiKey = await getDeepSeekApiKey();
+  if (!apiKey) return;
   try {
     const { status, body } = await fetchJson(DEEPSEEK_BALANCE_URL, {
       credentials: 'omit',
       headers: {
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+        'Authorization': `Bearer ${apiKey}`,
         'Accept': 'application/json'
       }
     });
@@ -117,7 +123,6 @@ const fetchMiMoBalance = async (pid) => {
       headers: { 'Content-Type': 'application/json' }
     });
     if (status === 200 && body?.code === 0) {
-      console.log('[mimo] balance:', body.data.balance, 'profile:', pid);
       await send({ type: 'vendor-balance', profile_id: pid, vendor: 'mimo', fetched_at: ts(), data: {
         balance: body.data.balance ?? '0',
         currency: body.data.currency ?? 'USD'
@@ -147,10 +152,10 @@ const fetchMiMoPlan = async (pid) => {
       }});
     } else {
       const reason = body?.code ? `code ${body.code}` : `HTTP ${status}`;
-      console.warn('[mimo] plan fetch failed:', reason);
+      await send({ type: 'vendor-status', profile_id: pid, vendor: 'mimo', fetched_at: ts(), reason: `plan ${reason}` });
     }
   } catch (e) {
-    console.warn('[mimo] plan fetch error:', e);
+    await send({ type: 'vendor-status', profile_id: pid, vendor: 'mimo', fetched_at: ts(), reason: 'plan network' });
   }
 };
 
@@ -181,6 +186,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'vendor-disable') {
-    send({ type: 'vendor-clear', vendor: msg.vendor });
+    getProfileId().then((pid) => {
+      send({ type: 'vendor-clear', profile_id: pid, vendor: msg.vendor });
+    });
   }
 });

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -60,6 +61,20 @@ def write_message(payload: dict) -> None:
 
 
 ACTIVE_PROFILE_FILE = CACHE_DIR / "vendor-active-profile"
+PID_RE = re.compile(r'^[0-9a-f]{8}$')
+VALID_VENDORS = frozenset({'deepseek', 'mimo'})
+
+
+def valid_pid(pid: object) -> str | None:
+    if isinstance(pid, str) and PID_RE.match(pid):
+        return pid
+    return None
+
+
+def valid_vendor(vendor: object) -> str | None:
+    if isinstance(vendor, str) and vendor in VALID_VENDORS:
+        return vendor
+    return None
 
 
 def update_active_profile(pid: str | None) -> None:
@@ -102,10 +117,14 @@ def handle(msg: dict) -> dict:
         return {"ok": True, "wrote": str(status)}
 
     if msg_type in ("vendor-balance", "vendor-plan", "vendor-status"):
+        if not valid_pid(pid):
+            return {"ok": False, "reason": "invalid profile_id"}
         update_active_profile(pid)
 
     if msg_type == "vendor-balance":
-        vendor = msg.get("vendor") or "unknown"
+        vendor = valid_vendor(msg.get("vendor"))
+        if not vendor:
+            return {"ok": False, "reason": "invalid vendor"}
         data = msg.get("data")
         if not isinstance(data, dict):
             return {"ok": False, "reason": "missing data"}
@@ -117,7 +136,9 @@ def handle(msg: dict) -> dict:
         return {"ok": True, "wrote": str(vcache)}
 
     if msg_type == "vendor-plan":
-        vendor = msg.get("vendor") or "unknown"
+        vendor = valid_vendor(msg.get("vendor"))
+        if not vendor:
+            return {"ok": False, "reason": "invalid vendor"}
         data = msg.get("data")
         if not isinstance(data, dict):
             return {"ok": False, "reason": "missing data"}
@@ -126,21 +147,32 @@ def handle(msg: dict) -> dict:
         return {"ok": True, "wrote": str(pcache)}
 
     if msg_type == "vendor-status":
-        vendor = msg.get("vendor") or "unknown"
+        vendor = valid_vendor(msg.get("vendor"))
+        if not vendor:
+            return {"ok": False, "reason": "invalid vendor"}
+        if not valid_pid(pid):
+            return {"ok": False, "reason": "invalid profile_id"}
         reason = msg.get("reason") or "unknown"
         vstatus = CACHE_DIR / f"vendor-{vendor}-{pid}.status"
         vstatus.write_text(f"{msg.get('fetched_at', '')}\t{reason}")
         return {"ok": True, "wrote": str(vstatus)}
 
     if msg_type == "vendor-clear":
-        vendor = msg.get("vendor") or "unknown"
+        vendor = valid_vendor(msg.get("vendor"))
+        if not vendor:
+            return {"ok": False, "reason": "invalid vendor"}
+        if not valid_pid(pid):
+            return {"ok": False, "reason": "invalid profile_id"}
         removed = []
-        for f in CACHE_DIR.glob(f"vendor-{vendor}-*{pid}*.json"):
-            f.unlink()
-            removed.append(str(f))
-        for f in CACHE_DIR.glob(f"vendor-{vendor}-*{pid}*.status"):
-            f.unlink()
-            removed.append(str(f))
+        for name in [
+            f"vendor-{vendor}-{pid}.json",
+            f"vendor-{vendor}-{pid}.status",
+            f"vendor-{vendor}-plan-{pid}.json",
+        ]:
+            p = CACHE_DIR / name
+            if p.exists():
+                p.unlink()
+                removed.append(name)
         return {"ok": True, "removed": removed}
 
     return {"ok": False, "reason": f"unknown type {msg_type!r}"}
