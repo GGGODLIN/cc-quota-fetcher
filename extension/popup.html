@@ -16,9 +16,14 @@
 <h3>CC Quota Fetcher</h3>
 <label><input type="checkbox" id="deepseek" checked> DeepSeek</label>
 <label><input type="checkbox" id="mimo" checked> MiMo</label>
+<label><input type="checkbox" id="glm" checked> GLM (z.ai)</label>
 <div class="field">
   <div class="field-label">DeepSeek API Key</div>
   <input type="text" id="ds-key" placeholder="sk-...">
+</div>
+<div class="field">
+  <div class="field-label">GLM API Key (z.ai)</div>
+  <input type="text" id="glm-key" placeholder="z.ai token (no Bearer prefix)">
 </div>
 <div class="status" id="status"></div>
 <script src="popup.js"></script>
