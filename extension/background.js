@@ -5,6 +5,7 @@ const PERIOD_MINUTES = 0.5;
 const DEEPSEEK_BALANCE_URL = 'https://api.deepseek.com/user/balance';
 const MIMO_BALANCE_URL = 'https://platform.xiaomimimo.com/api/v1/balance';
 const MIMO_PLAN_URL = 'https://platform.xiaomimimo.com/api/v1/tokenPlan/usage';
+const GLM_QUOTA_URL = 'https://api.z.ai/api/monitor/usage/quota/limit';
 
 const FETCH_TIMEOUT_MS = 15000;
 const fetchJson = async (url, opts = {}) => {
@@ -30,7 +31,7 @@ const getProfileId = async () => {
   return _profileId;
 };
 
-const VENDOR_DEFAULTS = { deepseek: true, mimo: true };
+const VENDOR_DEFAULTS = { deepseek: true, mimo: true, glm: true };
 
 const getVendorConfig = async () => {
   const stored = await chrome.storage.local.get('vendor_enabled');
@@ -40,6 +41,11 @@ const getVendorConfig = async () => {
 const getDeepSeekApiKey = async () => {
   const stored = await chrome.storage.local.get('deepseek_api_key');
   return stored.deepseek_api_key ?? '';
+};
+
+const getGlmApiKey = async () => {
+  const stored = await chrome.storage.local.get('glm_api_key');
+  return stored.glm_api_key ?? '';
 };
 
 const send = (payload) => new Promise((resolve) => {
@@ -164,6 +170,32 @@ const fetchMiMoPlan = async (pid) => {
   }
 };
 
+const fetchGlmQuota = async (pid) => {
+  const apiKey = await getGlmApiKey();
+  if (!apiKey) return;
+  try {
+    const { status, body } = await fetchJson(GLM_QUOTA_URL, {
+      credentials: 'omit',
+      headers: {
+        'Authorization': apiKey,
+        'Accept-Language': 'en-US,en',
+        'Content-Type': 'application/json'
+      }
+    });
+    if (status === 200 && body?.success && body.data) {
+      await send({ type: 'vendor-balance', profile_id: pid, vendor: 'glm', fetched_at: ts(), data: {
+        level: body.data.level ?? 'glm',
+        limits: body.data.limits ?? []
+      }});
+    } else {
+      const reason = body?.msg ? `msg ${body.msg}` : `HTTP ${status}`;
+      await send({ type: 'vendor-status', profile_id: pid, vendor: 'glm', fetched_at: ts(), reason });
+    }
+  } catch (e) {
+    await send({ type: 'vendor-status', profile_id: pid, vendor: 'glm', fetched_at: ts(), reason: 'network' });
+  }
+};
+
 const ensureAlarm = async () => {
   const existing = await chrome.alarms.get(ALARM_NAME);
   if (!existing) chrome.alarms.create(ALARM_NAME, { periodInMinutes: PERIOD_MINUTES });
@@ -179,6 +211,7 @@ const tick = async () => {
     await fetchMiMoBalance(pid);
     await fetchMiMoPlan(pid);
   }
+  if (cfg.glm) await fetchGlmQuota(pid);
 };
 
 chrome.runtime.onInstalled.addListener(() => {

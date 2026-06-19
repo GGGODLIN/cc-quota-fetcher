@@ -62,7 +62,7 @@ def write_message(payload: dict) -> None:
 
 ACTIVE_PROFILE_FILE = CACHE_DIR / "vendor-active-profile"
 PID_RE = re.compile(r'^[0-9a-f]{8}$')
-VALID_VENDORS = frozenset({'deepseek', 'mimo'})
+VALID_VENDORS = frozenset({'deepseek', 'mimo', 'glm'})
 
 
 def valid_pid(pid: object) -> str | None:
