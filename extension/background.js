@@ -6,9 +6,16 @@ const DEEPSEEK_BALANCE_URL = 'https://api.deepseek.com/user/balance';
 const MIMO_BALANCE_URL = 'https://platform.xiaomimimo.com/api/v1/balance';
 const MIMO_PLAN_URL = 'https://platform.xiaomimimo.com/api/v1/tokenPlan/usage';
 
+const FETCH_TIMEOUT_MS = 15000;
 const fetchJson = async (url, opts = {}) => {
-  const resp = await fetch(url, Object.assign({ credentials: 'include' }, opts));
-  return { status: resp.status, body: resp.ok ? await resp.json() : null };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, Object.assign({ credentials: 'include', signal: ctrl.signal }, opts));
+    return { status: resp.status, body: resp.ok ? await resp.json() : null };
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 const ts = () => new Date().toTimeString().slice(0, 8);
@@ -103,10 +110,8 @@ const fetchDeepSeekBalance = async (pid) => {
       }
     });
     if (status === 200 && body) {
-      const info = body.balance_infos?.[0] ?? {};
       await send({ type: 'vendor-balance', profile_id: pid, vendor: 'deepseek', fetched_at: ts(), data: {
-        balance: info.total_balance ?? '0',
-        currency: info.currency ?? 'USD'
+        balance_infos: body.balance_infos ?? []
       }});
     } else {
       await send({ type: 'vendor-status', profile_id: pid, vendor: 'deepseek', fetched_at: ts(), reason: `HTTP ${status}` });
@@ -159,7 +164,13 @@ const fetchMiMoPlan = async (pid) => {
   }
 };
 
+const ensureAlarm = async () => {
+  const existing = await chrome.alarms.get(ALARM_NAME);
+  if (!existing) chrome.alarms.create(ALARM_NAME, { periodInMinutes: PERIOD_MINUTES });
+};
+
 const tick = async () => {
+  await ensureAlarm();
   const pid = await getProfileId();
   const cfg = await getVendorConfig();
   await fetchAnthropicQuota(pid);
