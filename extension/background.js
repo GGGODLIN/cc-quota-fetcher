@@ -31,7 +31,7 @@ const getProfileId = async () => {
   return _profileId;
 };
 
-const VENDOR_DEFAULTS = { deepseek: true, mimo: true, glm: true };
+const VENDOR_DEFAULTS = { deepseek: true, mimo: false, glm: true };
 
 const getVendorConfig = async () => {
   const stored = await chrome.storage.local.get('vendor_enabled');
