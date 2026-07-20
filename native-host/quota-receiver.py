@@ -15,11 +15,12 @@ Output contract:
 from __future__ import annotations
 
 import json
-import os
 import re
 import struct
 import sys
 from pathlib import Path
+
+import keychain
 
 CACHE_DIR = Path.home() / ".claude" / "cache"
 LOG_FILE = Path.home() / ".claude" / "cache" / "quota-receiver.log"
@@ -32,10 +33,6 @@ def log(msg: str) -> None:
             f.write(msg + "\n")
     except Exception:
         pass
-
-
-import datetime
-log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] INVOKED pid={os.getpid()} ppid={os.getppid()} python={sys.executable}")
 
 
 def email_safe(email: str) -> str:
@@ -62,7 +59,8 @@ def write_message(payload: dict) -> None:
 
 ACTIVE_PROFILE_FILE = CACHE_DIR / "vendor-active-profile"
 PID_RE = re.compile(r'^[0-9a-f]{8}$')
-VALID_VENDORS = frozenset({'deepseek', 'mimo', 'glm'})
+WRITABLE_VENDORS = frozenset({'mimo', 'glm'})
+CLEARABLE_VENDORS = frozenset({'deepseek', 'mimo', 'glm'})
 
 
 def valid_pid(pid: object) -> str | None:
@@ -71,8 +69,8 @@ def valid_pid(pid: object) -> str | None:
     return None
 
 
-def valid_vendor(vendor: object) -> str | None:
-    if isinstance(vendor, str) and vendor in VALID_VENDORS:
+def valid_vendor(vendor: object, allowed: frozenset[str]) -> str | None:
+    if isinstance(vendor, str) and vendor in allowed:
         return vendor
     return None
 
@@ -86,9 +84,37 @@ def update_active_profile(pid: str | None) -> None:
         pass
 
 
+def valid_secret(secret: object) -> str | None:
+    if not isinstance(secret, str) or not 8 <= len(secret) <= 4096:
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in secret):
+        return None
+    return secret
+
+
+def migrate_deepseek_key(msg: dict) -> dict:
+    if not valid_pid(msg.get("profile_id")):
+        return {"ok": False, "reason": "invalid-profile"}
+    secret = valid_secret(msg.get("secret"))
+    if secret is None:
+        return {"ok": False, "reason": "invalid-secret"}
+    try:
+        accepted = keychain.create_secret_if_absent(secret)
+    except keychain.KeychainError as error:
+        reason = str(error)
+        if reason not in {"keychain-read-failed", "keychain-write-failed"}:
+            reason = "keychain-write-failed"
+        return {"ok": False, "reason": reason}
+    if not accepted:
+        return {"ok": False, "reason": "profile-conflict"}
+    return {"ok": True}
+
+
 def handle(msg: dict) -> dict:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     msg_type = msg.get("type")
+    if msg_type == "migrate-deepseek-key-v1":
+        return migrate_deepseek_key(msg)
     email = msg.get("email") or "unknown"
     safe = email_safe(email)
     cache = CACHE_DIR / f"quota-{safe}.json"
@@ -98,7 +124,7 @@ def handle(msg: dict) -> dict:
     if msg_type == "quota":
         body = msg.get("body")
         if not isinstance(body, dict):
-            return {"ok": False, "reason": "missing body"}
+            return {"ok": False, "reason": "missing-body"}
         envelope = {
             "fetched_at": msg.get("fetched_at"),
             "email": email,
@@ -118,16 +144,16 @@ def handle(msg: dict) -> dict:
 
     if msg_type in ("vendor-balance", "vendor-plan", "vendor-status"):
         if not valid_pid(pid):
-            return {"ok": False, "reason": "invalid profile_id"}
+            return {"ok": False, "reason": "invalid-profile"}
+        vendor = valid_vendor(msg.get("vendor"), WRITABLE_VENDORS)
+        if not vendor:
+            return {"ok": False, "reason": "invalid-vendor"}
         update_active_profile(pid)
 
     if msg_type == "vendor-balance":
-        vendor = valid_vendor(msg.get("vendor"))
-        if not vendor:
-            return {"ok": False, "reason": "invalid vendor"}
         data = msg.get("data")
         if not isinstance(data, dict):
-            return {"ok": False, "reason": "missing data"}
+            return {"ok": False, "reason": "missing-data"}
         vcache = CACHE_DIR / f"vendor-{vendor}-{pid}.json"
         vstatus = CACHE_DIR / f"vendor-{vendor}-{pid}.status"
         vcache.write_text(json.dumps({"vendor": vendor, "profile_id": pid, "data": data}))
@@ -136,33 +162,25 @@ def handle(msg: dict) -> dict:
         return {"ok": True, "wrote": str(vcache)}
 
     if msg_type == "vendor-plan":
-        vendor = valid_vendor(msg.get("vendor"))
-        if not vendor:
-            return {"ok": False, "reason": "invalid vendor"}
         data = msg.get("data")
         if not isinstance(data, dict):
-            return {"ok": False, "reason": "missing data"}
+            return {"ok": False, "reason": "missing-data"}
         pcache = CACHE_DIR / f"vendor-{vendor}-plan-{pid}.json"
         pcache.write_text(json.dumps({"vendor": vendor, "profile_id": pid, "data": data}))
         return {"ok": True, "wrote": str(pcache)}
 
     if msg_type == "vendor-status":
-        vendor = valid_vendor(msg.get("vendor"))
-        if not vendor:
-            return {"ok": False, "reason": "invalid vendor"}
-        if not valid_pid(pid):
-            return {"ok": False, "reason": "invalid profile_id"}
         reason = msg.get("reason") or "unknown"
         vstatus = CACHE_DIR / f"vendor-{vendor}-{pid}.status"
         vstatus.write_text(f"{msg.get('fetched_at', '')}\t{reason}")
         return {"ok": True, "wrote": str(vstatus)}
 
     if msg_type == "vendor-clear":
-        vendor = valid_vendor(msg.get("vendor"))
+        vendor = valid_vendor(msg.get("vendor"), CLEARABLE_VENDORS)
         if not vendor:
-            return {"ok": False, "reason": "invalid vendor"}
+            return {"ok": False, "reason": "invalid-vendor"}
         if not valid_pid(pid):
-            return {"ok": False, "reason": "invalid profile_id"}
+            return {"ok": False, "reason": "invalid-profile"}
         removed = []
         for name in [
             f"vendor-{vendor}-{pid}.json",
@@ -175,23 +193,24 @@ def handle(msg: dict) -> dict:
                 removed.append(name)
         return {"ok": True, "removed": removed}
 
-    return {"ok": False, "reason": f"unknown type {msg_type!r}"}
+    return {"ok": False, "reason": "unknown-type"}
 
 
 def main() -> int:
     try:
         msg = read_message()
         if msg is None:
-            log("empty stdin")
             return 0
-        log(f"recv: {msg.get('type')} email={msg.get('email')}")
+        if not isinstance(msg, dict):
+            write_message({"ok": False, "reason": "invalid-message"})
+            return 1
         resp = handle(msg)
         write_message(resp)
         return 0
-    except Exception as e:
-        log(f"error: {e!r}")
+    except Exception:
+        log("internal-error")
         try:
-            write_message({"ok": False, "reason": str(e)})
+            write_message({"ok": False, "reason": "internal-error"})
         except Exception:
             pass
         return 1

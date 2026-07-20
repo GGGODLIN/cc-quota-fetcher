@@ -5,26 +5,15 @@
 <style>
   body { width: 220px; padding: 12px; font-family: system-ui; font-size: 13px; margin: 0; }
   h3 { margin: 0 0 10px; font-size: 14px; }
-  label { display: flex; align-items: center; gap: 6px; padding: 4px 0; cursor: pointer; }
+  label { display: flex; align-items: center; gap: 6px; padding: 4px 0; color: #777; }
+  .retired { margin-left: auto; font-size: 10px; text-transform: uppercase; }
   .status { margin-top: 8px; font-size: 11px; color: #666; }
-  input[type="text"] { width: 100%; box-sizing: border-box; font-size: 11px; padding: 3px 4px; margin-top: 2px; }
-  .field { margin-top: 6px; }
-  .field-label { font-size: 11px; color: #444; }
 </style>
 </head>
 <body>
 <h3>CC Quota Fetcher</h3>
-<label><input type="checkbox" id="deepseek" checked> DeepSeek</label>
-<label><input type="checkbox" id="mimo" checked> MiMo</label>
-<label><input type="checkbox" id="glm" checked> GLM (z.ai)</label>
-<div class="field">
-  <div class="field-label">DeepSeek API Key</div>
-  <input type="text" id="ds-key" placeholder="sk-...">
-</div>
-<div class="field">
-  <div class="field-label">GLM API Key (z.ai)</div>
-  <input type="text" id="glm-key" placeholder="z.ai token (no Bearer prefix)">
-</div>
+<label><input type="checkbox" id="mimo" disabled> MiMo <span class="retired">Retired</span></label>
+<label><input type="checkbox" id="glm" disabled> GLM (z.ai) <span class="retired">Retired</span></label>
 <div class="status" id="status"></div>
 <script src="popup.js"></script>
 </body>

@@ -2,7 +2,6 @@ const NATIVE_HOST = 'com.cc.quota_writer';
 const ALARM_NAME = 'cc-quota-fetch';
 const PERIOD_MINUTES = 0.5;
 
-const DEEPSEEK_BALANCE_URL = 'https://api.deepseek.com/user/balance';
 const MIMO_BALANCE_URL = 'https://platform.xiaomimimo.com/api/v1/balance';
 const MIMO_PLAN_URL = 'https://platform.xiaomimimo.com/api/v1/tokenPlan/usage';
 const GLM_QUOTA_URL = 'https://api.z.ai/api/monitor/usage/quota/limit';
@@ -22,25 +21,30 @@ const fetchJson = async (url, opts = {}) => {
 const ts = () => new Date().toTimeString().slice(0, 8);
 
 let _profileId = null;
+let _profileIdPromise = null;
 const getProfileId = async () => {
   if (_profileId) return _profileId;
-  const stored = await chrome.storage.local.get('profile_id');
-  if (stored.profile_id) { _profileId = stored.profile_id; return _profileId; }
-  _profileId = crypto.randomUUID().slice(0, 8);
-  await chrome.storage.local.set({ profile_id: _profileId });
-  return _profileId;
+  if (_profileIdPromise) return _profileIdPromise;
+  _profileIdPromise = (async () => {
+    const stored = await chrome.storage.local.get('profile_id');
+    if (stored.profile_id) { _profileId = stored.profile_id; return _profileId; }
+    _profileId = crypto.randomUUID().slice(0, 8);
+    await chrome.storage.local.set({ profile_id: _profileId });
+    return _profileId;
+  })();
+  try {
+    return await _profileIdPromise;
+  } finally {
+    _profileIdPromise = null;
+  }
 };
 
-const VENDOR_DEFAULTS = { deepseek: true, mimo: false, glm: true };
+const VENDOR_DEFAULTS = { deepseek: false, mimo: false, glm: false };
+const DEEPSEEK_KEY_MIGRATION_VERSION = 1;
 
-const getVendorConfig = async () => {
-  const stored = await chrome.storage.local.get('vendor_enabled');
-  return Object.assign({}, VENDOR_DEFAULTS, stored.vendor_enabled ?? {});
-};
-
-const getDeepSeekApiKey = async () => {
-  const stored = await chrome.storage.local.get('deepseek_api_key');
-  return stored.deepseek_api_key ?? '';
+const fingerprintSecret = async (secret) => {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 };
 
 const getGlmApiKey = async () => {
@@ -61,6 +65,45 @@ const send = (payload) => new Promise((resolve) => {
     resolve(null);
   }
 });
+
+const migrateDeepSeekKey = async () => {
+  try {
+    const stored = await chrome.storage.local.get([
+      'deepseek_api_key',
+      'deepseek_key_migration_version',
+      'deepseek_key_migration_fingerprint'
+    ]);
+    const secret = stored.deepseek_api_key;
+    if (typeof secret !== 'string' || secret.length === 0) return;
+    const fingerprint = await fingerprintSecret(secret);
+    if (
+      stored.deepseek_key_migration_version === DEEPSEEK_KEY_MIGRATION_VERSION
+      && stored.deepseek_key_migration_fingerprint === fingerprint
+    ) return;
+    const pid = await getProfileId();
+    const migrated = await send({
+      type: 'migrate-deepseek-key-v1',
+      profile_id: pid,
+      secret
+    });
+    if (migrated?.ok !== true) return;
+    const current = await chrome.storage.local.get('deepseek_api_key');
+    if (current.deepseek_api_key !== secret) return;
+    const cleared = await send({ type: 'vendor-clear', profile_id: pid, vendor: 'deepseek' });
+    if (cleared?.ok !== true) return;
+    const confirmed = await chrome.storage.local.get('deepseek_api_key');
+    if (confirmed.deepseek_api_key !== secret) return;
+    const latest = await chrome.storage.local.get('vendor_enabled');
+    const config = Object.assign({}, VENDOR_DEFAULTS, latest.vendor_enabled ?? {}, { deepseek: false });
+    await chrome.storage.local.set({
+      vendor_enabled: config,
+      deepseek_key_migration_version: DEEPSEEK_KEY_MIGRATION_VERSION,
+      deepseek_key_migration_fingerprint: fingerprint
+    });
+  } catch (e) {
+    return;
+  }
+};
 
 const fetchAnthropicQuota = async (pid) => {
   let bootstrap;
@@ -101,29 +144,6 @@ const fetchAnthropicQuota = async (pid) => {
     }
   } catch (e) {
     await send({ type: 'status', profile_id: pid, email, org_id: orgId, fetched_at: ts(), reason: 'network' });
-  }
-};
-
-const fetchDeepSeekBalance = async (pid) => {
-  const apiKey = await getDeepSeekApiKey();
-  if (!apiKey) return;
-  try {
-    const { status, body } = await fetchJson(DEEPSEEK_BALANCE_URL, {
-      credentials: 'omit',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Accept': 'application/json'
-      }
-    });
-    if (status === 200 && body) {
-      await send({ type: 'vendor-balance', profile_id: pid, vendor: 'deepseek', fetched_at: ts(), data: {
-        balance_infos: body.balance_infos ?? []
-      }});
-    } else {
-      await send({ type: 'vendor-status', profile_id: pid, vendor: 'deepseek', fetched_at: ts(), reason: `HTTP ${status}` });
-    }
-  } catch (e) {
-    await send({ type: 'vendor-status', profile_id: pid, vendor: 'deepseek', fetched_at: ts(), reason: 'network' });
   }
 };
 
@@ -204,15 +224,10 @@ const ensureAlarm = async () => {
 const tick = async () => {
   await ensureAlarm();
   const pid = await getProfileId();
-  const cfg = await getVendorConfig();
   await fetchAnthropicQuota(pid);
-  if (cfg.deepseek) await fetchDeepSeekBalance(pid);
-  if (cfg.mimo) {
-    await fetchMiMoBalance(pid);
-    await fetchMiMoPlan(pid);
-  }
-  if (cfg.glm) await fetchGlmQuota(pid);
 };
+
+void migrateDeepSeekKey();
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: PERIOD_MINUTES });
@@ -226,12 +241,4 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) tick();
-});
-
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'vendor-disable') {
-    getProfileId().then((pid) => {
-      send({ type: 'vendor-clear', profile_id: pid, vendor: msg.vendor });
-    });
-  }
 });

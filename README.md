@@ -1,6 +1,6 @@
 # cc-quota-fetcher
 
-Push claude.ai usage quota into local cache files for statusline / external consumption.
+Write Claude, Codex, and DeepSeek quota data into local cache files for statusline and external consumption.
 
 ## Why
 
@@ -12,27 +12,26 @@ The goal: a statusline showing live usage percentages for two Claude accounts si
 - Chrome 147 (and likely earlier) on macOS no longer encrypts cookies with the old PBKDF2 + AES-CBC scheme. The `v10` prefix is still present but the inner format is different; existing decrypters output binary garbage. Reverse-engineering the new scheme to keep up with Chrome releases isn't worth the maintenance.
 - Even with the cookie in hand, Cloudflare blocks plain `curl` to `claude.ai`. It checks TLS JA3/JA4 fingerprints and HTTP/2 frame ordering, not just cookies. `cf_clearance` cookies are bound to the originating client fingerprint, so copying them out of Chrome doesn't transfer. `curl-impersonate` partially works but is in an arms race with Cloudflare's fingerprint database.
 
-**Approach 3 — Read what Chrome already fetched.** Chrome itself retrieves usage data when you visit `claude.ai/settings/usage`. If we let Chrome do the fetching (real client, real cookies, real fingerprints) and just consume the result locally, both problems disappear. This is what a Chrome extension plus native messaging is for.
+**Approach 3 — Let Chrome fetch Claude, but keep local-token providers native.** Chrome can call the Claude web endpoint with its real session, TLS fingerprint, and Cloudflare state. Codex already maintains OAuth credentials in `~/.codex/auth.json`, while DeepSeek uses an API key that belongs in macOS Keychain. Those providers do not need browser sessions.
 
-So: a small extension runs in each authed Chrome profile, fetches usage on a timer, and pipes the JSON through a native messaging host into `~/.claude/cache/`. A shell script reads the cache files and renders the statusline. Chrome handles auth and Cloudflare; the extension is ~80 lines; the receiver is stdlib Python. The main caveat is that Chrome must be running for the cache to stay fresh.
+The resulting split has one writer per cache. The extension fetches only Claude and uses native messaging for cache writes. A separate one-shot Python poller owns the Codex and DeepSeek local caches. A LaunchAgent starts the poller every 30 seconds, while a nonblocking file lock prevents overlapping runs. Chrome must remain open only for Claude quota updates.
 
 ## Architecture
 
 ```
-chrome (profile A)                   chrome (profile B)
-  └─ extension                         └─ extension
-       │ alarm 1 min                        │
-       ▼                                    ▼
-  fetch /api/bootstrap (email + org_id)  same
-       │                                    │
-       ▼                                    ▼
-  fetch /api/organizations/<org>/usage   same
-       │ result                              │
-       ▼                                    ▼
-  chrome.runtime.sendNativeMessage ────► native-host/quota-receiver.py
-                                              └─ stdin JSON → write
-                                                  ~/.claude/cache/quota-<email>.json
-                                                  ~/.claude/cache/quota-<email>.status (on failure)
+Chrome profile A/B
+  └─ MV3 extension alarm
+       └─ Claude web usage
+            └─ Native Messaging
+                 └─ quota-receiver.py
+                      └─ ~/.claude/cache/quota-<email>.*
+
+launchd StartInterval=30
+  └─ quota_poller.py --once
+       ├─ ~/.codex/auth.json → Codex usage
+       │    └─ ~/.claude/cache/vendor-codex-local.*
+       └─ macOS Keychain → DeepSeek balance
+            └─ ~/.claude/cache/vendor-deepseek-local.*
 ```
 
 ## Output contract
@@ -56,6 +55,22 @@ chrome (profile A)                   chrome (profile B)
 
 Schema of `.data` matches `/api/oauth/usage`: `five_hour.utilization`, `seven_day.utilization`, `extra_usage.*`, etc.
 
+## Native Codex and DeepSeek caches
+
+The native poller writes successful responses as `{fetched_at, data}` and fixed-code failures as `{failed_at, reason}`:
+
+- `~/.claude/cache/vendor-codex-local.json` and `.status`
+- `~/.claude/cache/vendor-deepseek-local.json` and `.status`
+- `~/.claude/cache/cc-quota-poller-state.json` for per-provider `Retry-After` deadlines
+
+Every JSON, status, and state write uses a same-directory temporary file, mode `0600`, `fsync`, and atomic replacement. A failed poll leaves the previous successful JSON in place.
+
+Codex rereads OAuth credentials from `~/.codex/auth.json` at the start of every poll, sends the bearer token with `ChatGPT-Account-Id`, and classifies quota windows by `limit_window_seconds`: `18000` is the session window and `604800` is the weekly window. The cache keeps `plan_type`, `session`, `weekly`, `additional_rate_limits`, and `credits`, but no token or account identity. The poller treats `auth.json` as read-only: it never refreshes, merges, or writes credentials. TokenBar or the Codex CLI owns credential refresh, while `401` and `403` responses produce fixed `unauthorized` and `forbidden` status reasons.
+
+DeepSeek reads service `com.cc.quota-fetcher.deepseek-api-key`, account `default`, from macOS Keychain and keeps the existing `balance_infos` shape with only `currency` and `total_balance`. The extension performs a one-time migration from `chrome.storage.local`. Migration uses an atomic create-only Keychain operation: a matching duplicate succeeds, a different duplicate returns `profile-conflict`, and no migration can overwrite an existing value. After native confirmation, the extension disables the retired browser writer, clears its legacy cache, and records `deepseek_key_migration_version = 1`. It intentionally retains the browser copy because the popup no longer reads or writes it, and automatic deletion could remove a newer value written after the migration snapshot.
+
+The Codex OAuth request and window mapping follow [TokenBar v1.5.0](https://github.com/Nanako0129/TokenBar/releases/tag/v1.5.0), with tighter local safeguards for a 10-second timeout, persistent `Retry-After`, nonoverlapping runs, and read-only credential ownership. This documents source behavior only; focused tests use synthetic responses and do not verify live provider APIs.
+
 ## Install
 
 ### 1. Load the extension in each Chrome profile
@@ -65,42 +80,66 @@ For each profile that should be tracked:
 1. Open `chrome://extensions/`
 2. Toggle **Developer mode** on
 3. Click **Load unpacked**, select the `extension/` directory
-4. Note the **extension ID** that Chrome assigns (32-char hex)
+4. Note the **extension ID** that Chrome assigns (32 characters in the `a`–`p` range)
 
 > Optional: edit `extension/icons/icon.svg` (any vector tool — Inkscape, Figma export, hand-edited XML — works), then regenerate the PNGs:
 > `python3 extension/icons/generate.py` (requires `brew install librsvg`). The committed PNGs are sufficient for normal use.
 
-### 2. Install the native messaging host
+### 2. Install the native host and poller
 
 ```bash
 ./native-host/install.sh <extension-id-1> [<extension-id-2>]
 ```
 
-This:
-1. Copies the receiver to `~/.claude/scripts/cc-quota-fetcher-host/quota-receiver.py` (deploy path).
-2. Writes `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.cc.quota_writer.json` pointing at the deployed receiver, with allowed extension IDs.
+The installer rejects extension IDs outside `^[a-p]{32}$`, validates the source Python, shell, JSON, and plist files, then renders the native-host manifest and LaunchAgent plist into a temporary staging directory. It validates both staged outputs before creating or replacing any deployment destination. Only after the full preflight succeeds does it atomically install `quota-receiver.py`, `quota_poller.py`, and `keychain.py` under `~/.claude/scripts/cc-quota-fetcher-host/`; install the staged manifest and plist; and restart only the independent `com.cc.quota-poller` LaunchAgent.
 
-**Why deploy outside the project directory?** macOS TCC (Sonoma+) blocks Chrome from spawning processes located under `~/Desktop/`, `~/Documents/`, `~/Downloads/`. Chrome silently fails to exec the host (no log entry) and the service worker reports `Native host has exited`. Deploying to `~/.claude/scripts/` (not TCC-protected) sidesteps this. Re-run `install.sh` after editing the receiver to redeploy.
+The deployment directory is outside `~/Desktop`, `~/Documents`, and `~/Downloads` because macOS privacy controls can prevent Chrome from spawning a native host from those locations.
 
-### 3. Reload the extension
+### 3. Reload the extension once
 
-In `chrome://extensions/`, hit the reload button on each loaded extension so it picks up the new native host.
+Reload each unpacked extension after deploying the new receiver. The service worker migrates a stored DeepSeek key without blocking Claude polling. After native confirmation, it disables the retired browser-side DeepSeek path, clears the profile-scoped legacy cache, records migration version 1, and preserves the browser key so a concurrently written newer value cannot be deleted.
 
-### 4. Verify
+### 4. Update or verify the DeepSeek Keychain item
 
-After ~1 minute, check `~/.claude/cache/`:
+To replace the Keychain value without placing it in command arguments or terminal output:
 
 ```bash
-ls -la ~/.claude/cache/
-cat ~/.claude/cache/quota-*.json | jq '.fetched_at, .data.five_hour.utilization'
+read -r -s DEEPSEEK_API_KEY
+printf '\n'
+printf '%s\n' "$DEEPSEEK_API_KEY" | /usr/bin/python3 "$HOME/.claude/scripts/cc-quota-fetcher-host/keychain.py" --set-stdin
+unset DEEPSEEK_API_KEY
 ```
 
-If nothing appears, check `~/.claude/cache/quota-receiver.log` for receiver errors.
+The helper calls macOS Security.framework directly, so the value stays on stdin and never enters subprocess arguments. To verify that the item is readable without printing it:
+
+```bash
+/usr/bin/python3 "$HOME/.claude/scripts/cc-quota-fetcher-host/keychain.py" --check
+```
+
+### 5. Restart or uninstall the poller
+
+```bash
+/bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/com.cc.quota-poller"
+```
+
+```bash
+/bin/launchctl bootout "gui/$(/usr/bin/id -u)/com.cc.quota-poller"
+rm -f "$HOME/Library/LaunchAgents/com.cc.quota-poller.plist"
+rm -f "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.cc.quota_writer.json"
+rm -rf "$HOME/.claude/scripts/cc-quota-fetcher-host"
+```
+
+### 6. Inspect nonsecret cache metadata
+
+```bash
+ls -la "$HOME/.claude/cache/vendor-codex-local.json" "$HOME/.claude/cache/vendor-deepseek-local.json"
+jq '{fetched_at, keys: (.data | keys)}' "$HOME/.claude/cache/vendor-codex-local.json" "$HOME/.claude/cache/vendor-deepseek-local.json"
+```
 
 ## Caveats
 
-- **Chrome must be running.** Service worker only fires alarms while Chrome is alive. Closed Chrome → cache goes stale.
-- **MV3 service worker is ephemeral.** `chrome.alarms` wakes the worker, but there is 30-60s jitter on the period.
-- **Dev-mode unpacked extension.** Chrome shows a "Disable developer mode extensions" warning bar occasionally.
-- **Native messaging is Chrome-specific.** Switching to Arc/Brave/Firefox requires re-implementing the host registration.
-- **Per-profile install.** Each Chrome profile that should fetch needs the extension loaded separately; each gets its own extension ID.
+- **Claude still depends on Chrome.** Closing Chrome stops only the Claude cache updates; the native Codex and DeepSeek poller remains independent.
+- **MV3 alarms have scheduling jitter.** The extension alarm is not a precise wall-clock timer.
+- **The Codex usage endpoint is private.** Its route or response schema may change; fixed-code status files report failures without replacing last-good data.
+- **DeepSeek has one local Keychain owner.** A second Chrome profile with a different stored key receives `profile-conflict` and keeps its browser copy for manual resolution.
+- **Tests are synthetic.** The repository checks parsing, retries, locking, atomic writes, and read-only auth handling without claiming live API behavior.
