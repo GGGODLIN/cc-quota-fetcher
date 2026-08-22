@@ -144,7 +144,7 @@ class PlistContractTests(unittest.TestCase):
         self.assertEqual(plist["Label"], "com.cc.anthropic-quota-poller")
         self.assertEqual(plist["ProgramArguments"][0], "__POLLER_PATH__")
         self.assertEqual(plist["ProgramArguments"][-1], "--once")
-        self.assertEqual(plist["StartInterval"], 600)
+        self.assertEqual(plist["StartInterval"], 180)
         self.assertTrue(plist["RunAtLoad"])
         self.assertNotIn("KeepAlive", plist)
 
