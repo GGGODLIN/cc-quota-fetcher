@@ -71,6 +71,25 @@ DeepSeek reads service `com.cc.quota-fetcher.deepseek-api-key`, account `default
 
 The Codex OAuth request and window mapping follow [TokenBar v1.5.0](https://github.com/Nanako0129/TokenBar/releases/tag/v1.5.0), with tighter local safeguards for a 10-second timeout, persistent `Retry-After`, nonoverlapping runs, and read-only credential ownership. This documents source behavior only; focused tests use synthetic responses and do not verify live provider APIs.
 
+## Native Anthropic poller
+
+`native-host/anthropic_quota_poller.py` polls `/api/oauth/usage` directly with the Claude Code keychain token, which is Approach 1 from the *Why* section. Its own docstring states the intent as replacing the extension path as the source of Anthropic quota data, and it writes the same cache contract `quota-receiver.py` does, so `usage-color.sh` consumes it unchanged. The extension's `fetchAnthropicQuota` still runs and still writes `quota-<email>.json`, so until one of the two is retired this cache has two writers, against the one-writer-per-cache rule the *Architecture* section states. The two do not share a throttle pool — the extension calls `claude.ai/api/organizations/<org>/usage` under the browser session, this poller calls `api.anthropic.com/api/oauth/usage` under the keychain token. It discovers accounts from `~/.claude/.claude.json` plus every `~/.claude-*/.claude.json`, and keys backoff deadlines by email in `~/.claude/cache/anthropic-quota-poller-state.json`.
+
+Approach 1's rate limit is the reason this poller runs at a 600-second interval rather than the extension poller's 30. A `429` carries `Retry-After`, but the endpoint sometimes answers `Retry-After: 0` while still refusing requests, so the honoured deadline is `max(Retry-After, MIN_RATE_LIMIT_BACKOFF_SECONDS)` with the floor at 1800 seconds. Without that floor a zero-valued header sets the deadline to the current second, the next scheduled run fires immediately, each retry keeps the limit warm, and the statusline never leaves `rate-limited`.
+
+Deployment is manual — `native-host/install.sh` owns only the extension path and does not touch this poller or its LaunchAgent:
+
+```bash
+cp native-host/anthropic_quota_poller.py ~/.claude/scripts/cc-quota-fetcher-host/anthropic_quota_poller.py
+chmod 700 ~/.claude/scripts/cc-quota-fetcher-host/anthropic_quota_poller.py
+python3 -c 'import plistlib,sys; src,dst,p=sys.argv[1:]; d=plistlib.load(open(src,"rb")); d["ProgramArguments"][0]=p; plistlib.dump(d,open(dst,"wb"),sort_keys=False)' \
+  native-host/com.cc.anthropic-quota-poller.plist \
+  ~/Library/LaunchAgents/com.cc.anthropic-quota-poller.plist \
+  ~/.claude/scripts/cc-quota-fetcher-host/anthropic_quota_poller.py
+launchctl bootout "gui/$(id -u)/com.cc.anthropic-quota-poller" 2>/dev/null
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.cc.anthropic-quota-poller.plist
+```
+
 ## Install
 
 ### 1. Load the extension in each Chrome profile
