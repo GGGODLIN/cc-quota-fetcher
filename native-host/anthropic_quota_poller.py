@@ -34,6 +34,12 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_RETRY_AFTER_SECONDS = 300
 MIN_RATE_LIMIT_BACKOFF_SECONDS = 1800
+# extension 正常時 cache age 最多約 60s（30s 一輪 + alarm jitter 實測 < 5s），
+# 90s 足以讓位。刻意壓在 StartInterval=180 的一半以下：門檻越靠近 180，越容易
+# 把 poller 自己上一輪的寫入誤判成「別人剛寫過」而跳過自己的排程。
+# extension 斷線後最壞 90 + 180 = 270s 接手，早於 usage-color.sh 的
+# OLD_AFTER_SECONDS=400，使用者不會看到 [N old]。
+DEFER_TO_CACHE_SECONDS = 90
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CACHE_DIR = Path.home() / ".claude" / "cache"
 STATE_PATH = CACHE_DIR / "anthropic-quota-poller-state.json"
@@ -250,9 +256,36 @@ def write_failure(email: str, reason: str, stamp: str) -> None:
     atomic_write_text(CACHE_DIR / f"quota-{safe}.status", f"{stamp}\t{reason}")
 
 
+def cache_covers_account(email: str, now: int) -> bool:
+    # 另一個 writer（cc-quota-fetcher chrome extension，30s 一輪）剛寫過就讓位，
+    # 這輪不打 API。要求帶 limits 才算完整——per-model（weekly_scoped）只存在於
+    # 這個陣列，缺了就得由本 poller 自己抓，否則 Fable 那格會斷更。
+    path = CACHE_DIR / f"quota-{email_safe(email)}.json"
+    try:
+        age = now - int(path.stat().st_mtime)
+    except OSError:
+        return False
+    if age < 0 or age >= DEFER_TO_CACHE_SECONDS:
+        return False
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    return isinstance(data.get("limits"), list)
+
+
 def poll_account(config_dir: Path, state: dict[str, Any], now: int, stamp: str) -> None:
     email, org_id = read_account_identity(config_dir)
     if email is None:
+        return
+    if cache_covers_account(email, now):
+        # 讓位時清掉本 poller 先前留下的哨兵，否則 usage-color.sh 會一直畫 ⚠
+        # 蓋掉那份其實新鮮的資料。
+        (CACHE_DIR / f"quota-{email_safe(email)}.status").unlink(missing_ok=True)
+        clear_not_before(state, email)
         return
     oauth = read_keychain_oauth(keychain_service_for(config_dir))
     if oauth is None:

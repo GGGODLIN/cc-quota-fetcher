@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import plistlib
 import sys
 import tempfile
@@ -133,6 +134,76 @@ class BackoffStateTests(unittest.TestCase):
 
         fetch.assert_not_called()
         failure.assert_not_called()
+
+
+class DeferToFresherWriterTests(unittest.TestCase):
+    def run_poll(self, cache_payload, cache_age, status_text=None):
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_dir = root / ".claude"
+            config_dir.mkdir()
+            (config_dir / ".claude.json").write_text(
+                json.dumps(
+                    {
+                        "oauthAccount": {
+                            "emailAddress": "user@example.com",
+                            "organizationUuid": "org-1",
+                        }
+                    }
+                )
+            )
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            status_path = cache_dir / "quota-user_at_example.com.status"
+            if status_text is not None:
+                status_path.write_text(status_text)
+            if cache_payload is not None:
+                cache_path = cache_dir / "quota-user_at_example.com.json"
+                cache_path.write_text(json.dumps(cache_payload))
+                stamp = now - cache_age
+                os.utime(cache_path, (stamp, stamp))
+
+            state = {"accounts": {}}
+            oauth = {"accessToken": "token", "expiresAt": (now + 3600) * 1000}
+            with mock.patch.object(poller, "CACHE_DIR", cache_dir):
+                with mock.patch.object(poller, "read_keychain_oauth", return_value=oauth):
+                    with mock.patch.object(
+                        poller, "fetch_usage", return_value={"limits": []}
+                    ) as fetch:
+                        poller.poll_account(config_dir, state, now, "13:47:08")
+            return fetch, status_path.exists()
+
+    def test_fresh_complete_cache_skips_the_request(self):
+        fetch, _ = self.run_poll({"data": {"limits": []}}, cache_age=10)
+        fetch.assert_not_called()
+
+    def test_fresh_cache_without_limits_still_fetches(self):
+        fetch, _ = self.run_poll({"data": {"five_hour": {}}}, cache_age=10)
+        fetch.assert_called_once()
+
+    def test_stale_cache_fetches(self):
+        fetch, _ = self.run_poll(
+            {"data": {"limits": []}}, cache_age=poller.DEFER_TO_CACHE_SECONDS
+        )
+        fetch.assert_called_once()
+
+    def test_one_second_under_the_threshold_still_defers(self):
+        fetch, _ = self.run_poll(
+            {"data": {"limits": []}}, cache_age=poller.DEFER_TO_CACHE_SECONDS - 1
+        )
+        fetch.assert_not_called()
+
+    def test_missing_cache_fetches(self):
+        fetch, _ = self.run_poll(None, cache_age=0)
+        fetch.assert_called_once()
+
+    def test_deferring_clears_a_stale_status_sentinel(self):
+        fetch, status_exists = self.run_poll(
+            {"data": {"limits": []}}, cache_age=10, status_text="12:00:00\trate-limited"
+        )
+        fetch.assert_not_called()
+        self.assertFalse(status_exists)
 
 
 class PlistContractTests(unittest.TestCase):
