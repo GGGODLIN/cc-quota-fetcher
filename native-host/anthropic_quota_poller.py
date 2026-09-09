@@ -134,6 +134,14 @@ def keychain_service_for(config_dir: Path) -> str:
     return f"{KEYCHAIN_SERVICE}-{digest}"
 
 
+def identity_path_for(config_dir: Path) -> Path:
+    # default 帳號的身分檔在 $HOME/.claude.json，不是 ~/.claude/.claude.json
+    # （後者是殘留檔、會滯留舊帳號）。兩段式慣例見 scripts/lib/resolve-account.sh
+    if config_dir == Path.home() / ".claude":
+        return Path.home() / ".claude.json"
+    return config_dir / ".claude.json"
+
+
 def read_keychain_oauth(service: str) -> dict[str, Any] | None:
     try:
         result = subprocess.run(
@@ -156,7 +164,7 @@ def read_keychain_oauth(service: str) -> dict[str, Any] | None:
 
 def read_account_identity(config_dir: Path) -> tuple[str | None, str | None]:
     try:
-        payload = json.loads((config_dir / ".claude.json").read_text())
+        payload = json.loads(identity_path_for(config_dir).read_text())
     except (OSError, json.JSONDecodeError):
         return None, None
     account = payload.get("oauthAccount")
@@ -174,7 +182,7 @@ def discover_config_dirs() -> list[Path]:
     home = Path.home()
     found = []
     default = home / ".claude"
-    if (default / ".claude.json").is_file():
+    if identity_path_for(default).is_file():
         found.append(default)
     for entry in sorted(home.glob(".claude-*")):
         if entry.is_dir() and (entry / ".claude.json").is_file():
