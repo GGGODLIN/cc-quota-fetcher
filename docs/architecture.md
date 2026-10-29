@@ -25,9 +25,9 @@ The poller is a one-shot process. `com.cc.quota-poller.plist` starts `quota_poll
 
 Codex flow:
 
-1. Reread `~/.codex/auth.json` at the start of every poll and reject API-key mode.
+1. Reread `~/.codex/auth.json` at the start of every poll and reject API-key mode. If `~/.config/cc-quota-fetcher/codex-source.json` exists (`{"magpie_logins": "<path to Magpie logins.json>", "user": "<account email>"}`), read the matching `agent: "codex"` login from Magpie instead, so the pill can follow an account the Codex CLI is not signed into. An unusable source file reports `source-invalid`, `account-not-found`, `auth-not-found`, or `auth-invalid` rather than falling back to the CLI login.
 2. Call `https://chatgpt.com/backend-api/wham/usage` once with bearer authorization and `ChatGPT-Account-Id`.
-3. Treat `auth.json` as read-only. The poller never refreshes, merges, or writes credentials; TokenBar or the Codex CLI owns refresh.
+3. Treat `auth.json` and Magpie's `logins.json` as read-only. The poller never refreshes, merges, or writes credentials; TokenBar, the Codex CLI, or Magpie owns refresh.
 4. Return fixed `unauthorized` and `forbidden` status reasons for `401` and `403` without retrying.
 5. Classify `18000`-second and `604800`-second windows as `session` and `weekly`, independent of primary or secondary position.
 6. Preserve only quota fields: `plan_type`, `session`, `weekly`, `additional_rate_limits`, and `credits`.

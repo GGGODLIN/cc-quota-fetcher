@@ -390,6 +390,45 @@ def load_codex_auth(path: Path) -> CodexCredentials:
     return credentials_from_auth(path, read_auth_json(path))
 
 
+def magpie_codex_auth(logins_path: Path, user: str) -> dict[str, Any]:
+    # Magpie refreshes its own logins; like auth.json, this file is only ever read here.
+    try:
+        logins = json.loads(logins_path.read_text())
+    except FileNotFoundError:
+        raise PollError("auth-not-found")
+    except (OSError, json.JSONDecodeError):
+        raise PollError("auth-invalid")
+    if not isinstance(logins, list):
+        raise PollError("auth-invalid")
+    for login in logins:
+        if isinstance(login, dict) and login.get("agent") == "codex" and login.get("user") == user:
+            auth = login.get("auth")
+            if not isinstance(auth, dict):
+                raise PollError("auth-invalid")
+            return auth
+    raise PollError("account-not-found")
+
+
+def load_codex_credentials(auth_path: Path, source_path: Path | None) -> CodexCredentials:
+    # The account lives in an untracked file so this public repo never names it. A broken
+    # source fails loudly instead of falling back: the CLI login would show another
+    # account's quota under the same pill.
+    if source_path is None:
+        return load_codex_auth(auth_path)
+    try:
+        source = json.loads(source_path.read_text())
+    except FileNotFoundError:
+        return load_codex_auth(auth_path)
+    except (OSError, json.JSONDecodeError):
+        raise PollError("source-invalid")
+    logins = source.get("magpie_logins") if isinstance(source, dict) else None
+    user = source.get("user") if isinstance(source, dict) else None
+    if not (isinstance(logins, str) and logins and isinstance(user, str) and user):
+        raise PollError("source-invalid")
+    logins_path = Path(logins).expanduser()
+    return credentials_from_auth(logins_path, magpie_codex_auth(logins_path, user))
+
+
 def codex_usage_request(credentials: CodexCredentials, transport: Callable[..., HttpResult]) -> HttpResult:
     return transport(
         CODEX_USAGE_URL,
@@ -408,9 +447,10 @@ def codex_usage_request(credentials: CodexCredentials, transport: Callable[..., 
 def poll_codex(
     auth_path: Path,
     now: int,
-    transport: Callable[..., HttpResult] = http_json
+    transport: Callable[..., HttpResult] = http_json,
+    source_path: Path | None = None
 ) -> dict[str, Any]:
-    credentials = load_codex_auth(auth_path)
+    credentials = load_codex_credentials(auth_path, source_path)
     result = codex_usage_request(credentials, transport)
     if result.status == 429:
         raise PollError(
@@ -501,6 +541,7 @@ def run_once(
     *,
     cache_dir: Path,
     auth_path: Path,
+    codex_source_path: Path | None = None,
     now: int | None = None,
     transport: Callable[..., HttpResult] = http_json,
     key_reader: Callable[[], str | None] = keychain.read_secret
@@ -517,7 +558,7 @@ def run_once(
             cache_dir,
             state_path,
             current_time,
-            lambda: poll_codex(auth_path, current_time, transport)
+            lambda: poll_codex(auth_path, current_time, transport, codex_source_path)
         )
         run_provider(
             "deepseek",
@@ -540,7 +581,8 @@ def main() -> int:
     home = Path.home()
     return run_once(
         cache_dir=home / ".claude" / "cache",
-        auth_path=home / ".codex" / "auth.json"
+        auth_path=home / ".codex" / "auth.json",
+        codex_source_path=home / ".config" / "cc-quota-fetcher" / "codex-source.json"
     )
 
 

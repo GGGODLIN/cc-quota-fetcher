@@ -382,6 +382,90 @@ class CodexAuthTests(unittest.TestCase):
             ])
 
 
+class CodexSourceTests(unittest.TestCase):
+    def write_magpie_logins(self, path):
+        logins = [
+            {"id": "a", "agent": "cline", "user": "work@example.com", "auth": None},
+            {"id": "b", "agent": "codex", "user": "personal@example.com",
+             "auth": auth_payload("personal-access-token", "refresh-p", "personal-account")},
+            {"id": "c", "agent": "codex", "user": "work@example.com",
+             "auth": auth_payload("work-access-token", "refresh-w", "work-account")}
+        ]
+        original = json.dumps(logins, indent=2).encode()
+        path.write_bytes(original)
+        return original
+
+    def recording_transport(self, seen):
+        def transport(url, *, method, headers, body, timeout):
+            seen.append((headers["Authorization"], headers["ChatGPT-Account-Id"]))
+            return quota_poller.HttpResult(200, {}, {
+                "plan_type": "synthetic-plan",
+                "rate_limit": {
+                    "secondary_window": {
+                        "used_percent": 20,
+                        "reset_at": 1_700_172_800,
+                        "limit_window_seconds": 604_800
+                    }
+                }
+            })
+        return transport
+
+    def test_source_file_selects_matching_magpie_codex_login_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logins_path = root / "logins.json"
+            original = self.write_magpie_logins(logins_path)
+            source_path = root / "codex-source.json"
+            source_path.write_text(json.dumps({"magpie_logins": str(logins_path), "user": "work@example.com"}))
+            (root / "auth.json").write_text(json.dumps(auth_payload("cli-access-token", "refresh-c")))
+            seen = []
+
+            data = quota_poller.poll_codex(
+                root / "auth.json", 1_700_000_000, self.recording_transport(seen), source_path
+            )
+
+            self.assertEqual(data["weekly"]["used_percent"], 20)
+            self.assertEqual(seen, [("Bearer work-access-token", "work-account")])
+            self.assertEqual(logins_path.read_bytes(), original)
+
+    def test_missing_source_file_keeps_following_codex_cli_auth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "auth.json").write_text(json.dumps(auth_payload("cli-access-token", "refresh-c", "cli-account")))
+            seen = []
+
+            quota_poller.poll_codex(
+                root / "auth.json", 1_700_000_000, self.recording_transport(seen), root / "absent.json"
+            )
+
+            self.assertEqual(seen, [("Bearer cli-access-token", "cli-account")])
+
+    def test_unknown_account_and_invalid_source_fail_without_falling_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logins_path = root / "logins.json"
+            self.write_magpie_logins(logins_path)
+            (root / "auth.json").write_text(json.dumps(auth_payload("cli-access-token", "refresh-c")))
+            source_path = root / "codex-source.json"
+
+            def unexpected_transport(*args, **kwargs):
+                self.fail("transport must not run when the configured source is unusable")
+
+            cases = [
+                (json.dumps({"magpie_logins": str(logins_path), "user": "nobody@example.com"}), "account-not-found"),
+                (json.dumps({"magpie_logins": str(logins_path)}), "source-invalid"),
+                ("not json", "source-invalid"),
+                (json.dumps({"magpie_logins": str(root / "missing.json"), "user": "work@example.com"}), "auth-not-found")
+            ]
+            for content, reason in cases:
+                with self.subTest(reason=reason, content=content):
+                    source_path.write_text(content)
+                    with self.assertRaisesRegex(quota_poller.PollError, reason):
+                        quota_poller.poll_codex(
+                            root / "auth.json", 1_700_000_000, unexpected_transport, source_path
+                        )
+
+
 class PollingTests(unittest.TestCase):
     def test_run_once_keeps_provider_failures_independent_and_persists_retry_after(self):
         with tempfile.TemporaryDirectory() as directory:
