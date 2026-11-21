@@ -205,6 +205,25 @@ class DeferToFresherWriterTests(unittest.TestCase):
         fetch.assert_not_called()
         self.assertFalse(status_exists)
 
+    def test_deferring_preserves_existing_rate_limit_backoff(self):
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_dir = root / ".claude"
+            config_dir.mkdir()
+            (config_dir / ".claude.json").write_text(
+                json.dumps({"oauthAccount": {"emailAddress": "user@example.com", "organizationUuid": "org-1"}})
+            )
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            cache_path = cache_dir / "quota-user_at_example.com.json"
+            cache_path.write_text(json.dumps({"data": {"limits": []}}))
+            os.utime(cache_path, (now - 10, now - 10))
+            state = {"accounts": {"user@example.com": {"not_before": now + 600}}}
+            with mock.patch.object(poller, "CACHE_DIR", cache_dir):
+                poller.poll_account(config_dir, state, now, "13:47:08")
+            self.assertEqual(state["accounts"]["user@example.com"]["not_before"], now + 600)
+
 
 class PlistContractTests(unittest.TestCase):
     def test_launch_agent_matches_the_poller_contract(self):

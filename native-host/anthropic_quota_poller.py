@@ -329,9 +329,8 @@ def poll_account(config_dir: Path, state: dict[str, Any], now: int, stamp: str) 
         return False
     if cache_covers_account(email, now):
         # 讓位時清掉本 poller 先前留下的哨兵，否則 usage-color.sh 會一直畫 ⚠
-        # 蓋掉那份其實新鮮的資料。
+        # 蓋掉那份其實新鮮的資料。瀏覽器寫入成功不會解除本 poller 的退避期限。
         (CACHE_DIR / f"quota-{email_safe(email)}.status").unlink(missing_ok=True)
-        clear_not_before(state, email)
         return True
     oauth = read_keychain_oauth(keychain_service_for(config_dir))
     if oauth is None:
