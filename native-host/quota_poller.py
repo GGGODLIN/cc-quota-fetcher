@@ -24,8 +24,13 @@ CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_RETRY_AFTER_SECONDS = 300
+MAX_BACKOFF_SECONDS = 86400
 SESSION_WINDOW_SECONDS = 18_000
 WEEKLY_WINDOW_SECONDS = 604_800
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid json constant: {value}")
 
 
 class PollError(RuntimeError):
@@ -56,13 +61,16 @@ def atomic_write_json(path: Path, payload: Any, pretty: bool = False) -> None:
         dir=path.parent
     )
     temporary_path = Path(temporary_name)
+    fd_closed = False
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            fd_closed = True
             json.dump(
                 payload,
                 handle,
                 ensure_ascii=False,
+                allow_nan=False,
                 indent=2 if pretty else None,
                 separators=None if pretty else (",", ":")
             )
@@ -77,10 +85,11 @@ def atomic_write_json(path: Path, payload: Any, pretty: bool = False) -> None:
         finally:
             os.close(directory_descriptor)
     except Exception:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        if not fd_closed:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         temporary_path.unlink(missing_ok=True)
         raise
 
@@ -101,14 +110,18 @@ def acquire_lock(path: Path):
 def parse_retry_after(value: str | None, now: int) -> int:
     if value is not None:
         stripped = value.strip()
-        if stripped.isdigit():
-            return max(0, int(stripped))
+        if stripped.isascii() and stripped.isdigit():
+            trimmed = stripped.lstrip("0") or "0"
+            if len(trimmed) > 6:
+                return MAX_BACKOFF_SECONDS
+            return min(MAX_BACKOFF_SECONDS, int(trimmed))
         try:
             parsed = parsedate_to_datetime(stripped)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
-            return max(0, math.ceil(parsed.timestamp() - now))
-        except (TypeError, ValueError, OverflowError):
+            delta = math.ceil(parsed.timestamp() - now)
+            return min(MAX_BACKOFF_SECONDS, max(0, delta))
+        except (TypeError, ValueError, OverflowError, OSError, IndexError):
             pass
     return DEFAULT_RETRY_AFTER_SECONDS
 
@@ -119,8 +132,11 @@ def empty_state() -> dict[str, Any]:
 
 def load_state(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return empty_state()
     if not isinstance(payload, dict) or not isinstance(payload.get("vendors"), dict):
         return empty_state()
@@ -142,9 +158,16 @@ def clear_not_before(path: Path, vendor: str) -> None:
 
 
 def is_backed_off(state: dict[str, Any], vendor: str, now: int) -> bool:
-    entry = state.get("vendors", {}).get(vendor, {})
+    if not isinstance(state, dict):
+        return False
+    vendors = state.get("vendors")
+    if not isinstance(vendors, dict):
+        return False
+    entry = vendors.get(vendor)
+    if not isinstance(entry, dict):
+        return False
     not_before = entry.get("not_before")
-    return isinstance(not_before, (int, float)) and not isinstance(not_before, bool) and now < not_before
+    return finite_number(not_before) and now < not_before
 
 
 def header_value(headers: dict[str, str], name: str) -> str | None:
@@ -166,8 +189,8 @@ def decode_json_bytes(raw: bytes, required: bool) -> Any:
             raise PollError("invalid-json")
         return None
     try:
-        return json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        return json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         if required:
             raise PollError("invalid-json")
         return None
@@ -223,10 +246,10 @@ def normalize_window(value: Any) -> dict[str, Any] | None:
     window_seconds = value.get("limit_window_seconds")
     if not finite_number(used_percent) or not 0 <= used_percent <= 100:
         return None
-    if not finite_number(window_seconds) or window_seconds <= 0:
+    if not finite_number(window_seconds) or int(window_seconds) <= 0:
         return None
     reset_at = value.get("reset_at")
-    if reset_at is not None and (not finite_number(reset_at) or reset_at <= 0):
+    if reset_at is not None and (not finite_number(reset_at) or int(reset_at) <= 0):
         return None
     result = {
         "used_percent": used_percent,
@@ -347,10 +370,13 @@ def token_value(tokens: dict[str, Any], snake_name: str, camel_name: str) -> str
 
 def read_auth_json(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant
+        )
     except FileNotFoundError:
         raise PollError("auth-not-found")
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise PollError("auth-invalid")
     if not isinstance(payload, dict):
         raise PollError("auth-invalid")
@@ -393,10 +419,13 @@ def load_codex_auth(path: Path) -> CodexCredentials:
 def magpie_codex_auth(logins_path: Path, user: str) -> dict[str, Any]:
     # Magpie refreshes its own logins; like auth.json, this file is only ever read here.
     try:
-        logins = json.loads(logins_path.read_text())
+        logins = json.loads(
+            logins_path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant
+        )
     except FileNotFoundError:
         raise PollError("auth-not-found")
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise PollError("auth-invalid")
     if not isinstance(logins, list):
         raise PollError("auth-invalid")
@@ -416,14 +445,19 @@ def load_codex_credentials(auth_path: Path, source_path: Path | None) -> CodexCr
     if source_path is None:
         return load_codex_auth(auth_path)
     try:
-        source = json.loads(source_path.read_text())
+        source = json.loads(
+            source_path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant
+        )
     except FileNotFoundError:
         return load_codex_auth(auth_path)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise PollError("source-invalid")
-    logins = source.get("magpie_logins") if isinstance(source, dict) else None
-    user = source.get("user") if isinstance(source, dict) else None
-    if not (isinstance(logins, str) and logins and isinstance(user, str) and user):
+    if not isinstance(source, dict):
+        raise PollError("source-invalid")
+    logins = source.get("magpie_logins")
+    user = source.get("user")
+    if not (isinstance(logins, str) and logins and "\x00" not in logins and isinstance(user, str) and user):
         raise PollError("source-invalid")
     logins_path = Path(logins).expanduser()
     return credentials_from_auth(logins_path, magpie_codex_auth(logins_path, user))

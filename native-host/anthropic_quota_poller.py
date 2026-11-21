@@ -34,6 +34,7 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_RETRY_AFTER_SECONDS = 300
 MIN_RATE_LIMIT_BACKOFF_SECONDS = 1800
+MAX_BACKOFF_SECONDS = 86400
 # extension 正常時 cache age 最多約 60s（30s 一輪 + alarm jitter 實測 < 5s），
 # 90s 足以讓位。刻意壓在 StartInterval=180 的一半以下：門檻越靠近 180，越容易
 # 把 poller 自己上一輪的寫入誤判成「別人剛寫過」而跳過自己的排程。
@@ -44,6 +45,10 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 CACHE_DIR = Path.home() / ".claude" / "cache"
 STATE_PATH = CACHE_DIR / "anthropic-quota-poller-state.json"
 LOCK_PATH = CACHE_DIR / "anthropic-quota-poller.lock"
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid json constant: {value}")
 
 
 class PollError(RuntimeError):
@@ -59,18 +64,21 @@ def atomic_write_text(path: Path, text: str) -> None:
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
     temporary_path = Path(temporary_name)
+    fd_closed = False
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            fd_closed = True
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
     except Exception:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        if not fd_closed:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         temporary_path.unlink(missing_ok=True)
         raise
 
@@ -89,8 +97,11 @@ def acquire_lock(path: Path):
 
 def load_state() -> dict[str, Any]:
     try:
-        payload = json.loads(STATE_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(
+            STATE_PATH.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return {"accounts": {}}
     if not isinstance(payload, dict) or not isinstance(payload.get("accounts"), dict):
         return {"accounts": {}}
@@ -98,33 +109,56 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
-    atomic_write_text(STATE_PATH, json.dumps(state))
+    atomic_write_text(STATE_PATH, json.dumps(state, allow_nan=False))
 
 
 def is_backed_off(state: dict[str, Any], key: str, now: int) -> bool:
-    not_before = state.get("accounts", {}).get(key, {}).get("not_before")
-    return isinstance(not_before, (int, float)) and not isinstance(not_before, bool) and now < not_before
+    if not isinstance(state, dict):
+        return False
+    accounts = state.get("accounts")
+    if not isinstance(accounts, dict):
+        return False
+    entry = accounts.get(key)
+    if not isinstance(entry, dict):
+        return False
+    not_before = entry.get("not_before")
+    return (
+        isinstance(not_before, (int, float))
+        and not isinstance(not_before, bool)
+        and math.isfinite(not_before)
+        and now < not_before
+    )
 
 
 def set_not_before(state: dict[str, Any], key: str, not_before: int) -> None:
-    state.setdefault("accounts", {})[key] = {"not_before": int(not_before)}
+    accounts = state.get("accounts")
+    if not isinstance(accounts, dict):
+        accounts = {}
+        state["accounts"] = accounts
+    accounts[key] = {"not_before": int(not_before)}
 
 
 def clear_not_before(state: dict[str, Any], key: str) -> None:
-    state.get("accounts", {}).pop(key, None)
+    accounts = state.get("accounts")
+    if isinstance(accounts, dict):
+        accounts.pop(key, None)
 
 
 def parse_retry_after(value: str | None, now: int) -> int:
     if value is not None:
         stripped = value.strip()
-        if stripped.isdigit():
-            return max(0, int(stripped))
+        if stripped.isascii() and stripped.isdigit():
+            trimmed = stripped.lstrip("0") or "0"
+            if len(trimmed) > 6:
+                return MAX_BACKOFF_SECONDS
+            return min(MAX_BACKOFF_SECONDS, int(trimmed))
         try:
             parsed = parsedate_to_datetime(stripped)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
-            return max(0, math.ceil(parsed.timestamp() - now))
-        except (TypeError, ValueError, OverflowError):
+            delta = math.ceil(parsed.timestamp() - now)
+            return min(MAX_BACKOFF_SECONDS, max(0, delta))
+        except (TypeError, ValueError, OverflowError, OSError, IndexError):
             pass
     return DEFAULT_RETRY_AFTER_SECONDS
 
@@ -156,13 +190,15 @@ def read_keychain_oauth(service: str) -> dict[str, Any] | None:
             text=True,
             timeout=HTTP_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
-    if result.returncode != 0 or not result.stdout.strip():
+    if result.returncode != 0 or not result.stdout or not result.stdout.strip():
         return None
     try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError:
+        payload = json.loads(result.stdout, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
         return None
     oauth = payload.get("claudeAiOauth")
     return oauth if isinstance(oauth, dict) else None
@@ -170,8 +206,13 @@ def read_keychain_oauth(service: str) -> dict[str, Any] | None:
 
 def read_account_identity(config_dir: Path) -> tuple[str | None, str | None]:
     try:
-        payload = json.loads(identity_path_for(config_dir).read_text())
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(
+            identity_path_for(config_dir).read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None, None
+    if not isinstance(payload, dict):
         return None, None
     account = payload.get("oauthAccount")
     if not isinstance(account, dict):
@@ -179,7 +220,7 @@ def read_account_identity(config_dir: Path) -> tuple[str | None, str | None]:
     email = account.get("emailAddress")
     org_id = account.get("organizationUuid")
     return (
-        email if isinstance(email, str) and email else None,
+        email if isinstance(email, str) and email and "\x00" not in email else None,
         org_id if isinstance(org_id, str) and org_id else None,
     )
 
@@ -236,8 +277,8 @@ def fetch_usage(access_token: str, now: int) -> dict[str, Any]:
     if not 200 <= status < 300:
         raise PollError("http-error")
     try:
-        body = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        body = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise PollError("invalid-json")
     if not isinstance(body, dict):
         raise PollError("invalid-schema")
@@ -247,7 +288,7 @@ def fetch_usage(access_token: str, now: int) -> dict[str, Any]:
 def write_success(email: str, org_id: str | None, body: dict[str, Any], stamp: str) -> None:
     safe = email_safe(email)
     envelope = {"fetched_at": stamp, "email": email, "org_id": org_id, "data": body}
-    atomic_write_text(CACHE_DIR / f"quota-{safe}.json", json.dumps(envelope))
+    atomic_write_text(CACHE_DIR / f"quota-{safe}.json", json.dumps(envelope, allow_nan=False))
     (CACHE_DIR / f"quota-{safe}.status").unlink(missing_ok=True)
 
 
@@ -268,8 +309,13 @@ def cache_covers_account(email: str, now: int) -> bool:
     if age < 0 or age >= DEFER_TO_CACHE_SECONDS:
         return False
     try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
         return False
     data = payload.get("data")
     if not isinstance(data, dict):
@@ -277,40 +323,45 @@ def cache_covers_account(email: str, now: int) -> bool:
     return isinstance(data.get("limits"), list)
 
 
-def poll_account(config_dir: Path, state: dict[str, Any], now: int, stamp: str) -> None:
+def poll_account(config_dir: Path, state: dict[str, Any], now: int, stamp: str) -> bool:
     email, org_id = read_account_identity(config_dir)
     if email is None:
-        return
+        return False
     if cache_covers_account(email, now):
         # 讓位時清掉本 poller 先前留下的哨兵，否則 usage-color.sh 會一直畫 ⚠
         # 蓋掉那份其實新鮮的資料。
         (CACHE_DIR / f"quota-{email_safe(email)}.status").unlink(missing_ok=True)
         clear_not_before(state, email)
-        return
+        return True
     oauth = read_keychain_oauth(keychain_service_for(config_dir))
     if oauth is None:
-        return
+        return False
     access_token = oauth.get("accessToken")
     if not isinstance(access_token, str) or not access_token:
-        return
+        return False
     expires_at = oauth.get("expiresAt")
-    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+    if (
+        isinstance(expires_at, (int, float))
+        and not isinstance(expires_at, bool)
+        and math.isfinite(expires_at)
+    ):
         if expires_at <= now * 1000:
-            return
+            return False
     if is_backed_off(state, email, now):
-        return
+        return True
     try:
         body = fetch_usage(access_token, now)
     except PollError as error:
         if error.retry_after is not None:
             set_not_before(state, email, now + error.retry_after)
         write_failure(email, error.code, stamp)
-        return
+        return True
     except Exception:
         write_failure(email, "internal-error", stamp)
-        return
+        return True
     clear_not_before(state, email)
     write_success(email, org_id, body, stamp)
+    return True
 
 
 def run_once() -> int:
@@ -323,13 +374,18 @@ def run_once() -> int:
         stamp = datetime.now().strftime("%H:%M:%S")
         state = load_state()
         seen: set[str] = set()
-        for config_dir in discover_config_dirs():
-            email, _ = read_account_identity(config_dir)
-            if email is None or email in seen:
-                continue
-            seen.add(email)
-            poll_account(config_dir, state, now, stamp)
-        save_state(state)
+        try:
+            for config_dir in discover_config_dirs():
+                try:
+                    email, _ = read_account_identity(config_dir)
+                    if email is None or email in seen:
+                        continue
+                    if poll_account(config_dir, state, now, stamp):
+                        seen.add(email)
+                except Exception:
+                    continue
+        finally:
+            save_state(state)
     finally:
         lock.close()
     return 0

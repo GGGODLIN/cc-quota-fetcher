@@ -15,15 +15,56 @@ Output contract:
 from __future__ import annotations
 
 import json
+import os
 import re
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 import keychain
 
 CACHE_DIR = Path.home() / ".claude" / "cache"
 LOG_FILE = Path.home() / ".claude" / "cache" / "quota-receiver.log"
+MAX_MESSAGE_BYTES = 1_048_576
+_EOF = object()
+
+
+class FrameError(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid json constant: {value}")
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    fd_closed = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            fd_closed = True
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        if not fd_closed:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def log(msg: str) -> None:
@@ -39,25 +80,34 @@ def email_safe(email: str) -> str:
     return email.replace("@", "_at_").replace("/", "_")
 
 
-def read_message() -> dict | None:
+def read_message() -> object:
     raw_len = sys.stdin.buffer.read(4)
+    if len(raw_len) == 0:
+        return _EOF
     if len(raw_len) != 4:
-        return None
+        raise FrameError("invalid-frame")
     msg_len = struct.unpack("<I", raw_len)[0]
+    if msg_len > MAX_MESSAGE_BYTES:
+        raise FrameError("message-too-large")
+    if msg_len == 0:
+        raise FrameError("invalid-message")
     raw = sys.stdin.buffer.read(msg_len)
     if len(raw) != msg_len:
-        return None
-    return json.loads(raw.decode("utf-8"))
+        raise FrameError("truncated-message")
+    try:
+        text = raw.decode("utf-8")
+        return json.loads(text, parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise FrameError("invalid-message")
 
 
 def write_message(payload: dict) -> None:
-    encoded = json.dumps(payload).encode("utf-8")
+    encoded = json.dumps(payload, allow_nan=False).encode("utf-8")
     sys.stdout.buffer.write(struct.pack("<I", len(encoded)))
     sys.stdout.buffer.write(encoded)
     sys.stdout.buffer.flush()
 
 
-ACTIVE_PROFILE_FILE = CACHE_DIR / "vendor-active-profile"
 PID_RE = re.compile(r'^[0-9a-f]{8}$')
 WRITABLE_VENDORS = frozenset({'mimo', 'glm'})
 CLEARABLE_VENDORS = frozenset({'deepseek', 'mimo', 'glm'})
@@ -79,7 +129,7 @@ def update_active_profile(pid: str | None) -> None:
     if not pid:
         return
     try:
-        ACTIVE_PROFILE_FILE.write_text(pid)
+        atomic_write_text(CACHE_DIR / "vendor-active-profile", pid)
     except Exception:
         pass
 
@@ -115,7 +165,10 @@ def handle(msg: dict) -> dict:
     msg_type = msg.get("type")
     if msg_type == "migrate-deepseek-key-v1":
         return migrate_deepseek_key(msg)
-    email = msg.get("email") or "unknown"
+    raw_email = msg.get("email")
+    if raw_email is not None and (not isinstance(raw_email, str) or "\x00" in raw_email):
+        return {"ok": False, "reason": "invalid-message"}
+    email = raw_email if raw_email else "unknown"
     safe = email_safe(email)
     cache = CACHE_DIR / f"quota-{safe}.json"
     status = CACHE_DIR / f"quota-{safe}.status"
@@ -131,15 +184,19 @@ def handle(msg: dict) -> dict:
             "org_id": msg.get("org_id"),
             "data": body,
         }
-        cache.write_text(json.dumps(envelope))
-        if status.exists():
-            status.unlink()
+        try:
+            encoded = json.dumps(envelope, allow_nan=False)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "invalid-message"}
+        atomic_write_text(cache, encoded)
+        status.unlink(missing_ok=True)
         return {"ok": True, "wrote": str(cache)}
 
     if msg_type == "status":
-        ts = msg.get("fetched_at") or ""
+        raw_ts = msg.get("fetched_at")
+        ts = "" if raw_ts is None else str(raw_ts)
         reason = msg.get("reason") or "unknown"
-        status.write_text(f"{ts}\t{reason}")
+        atomic_write_text(status, f"{ts}\t{reason}")
         return {"ok": True, "wrote": str(status)}
 
     if msg_type in ("vendor-balance", "vendor-plan", "vendor-status"):
@@ -156,9 +213,15 @@ def handle(msg: dict) -> dict:
             return {"ok": False, "reason": "missing-data"}
         vcache = CACHE_DIR / f"vendor-{vendor}-{pid}.json"
         vstatus = CACHE_DIR / f"vendor-{vendor}-{pid}.status"
-        vcache.write_text(json.dumps({"vendor": vendor, "profile_id": pid, "data": data}))
-        if vstatus.exists():
-            vstatus.unlink()
+        try:
+            encoded = json.dumps(
+                {"vendor": vendor, "profile_id": pid, "data": data},
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "invalid-message"}
+        atomic_write_text(vcache, encoded)
+        vstatus.unlink(missing_ok=True)
         return {"ok": True, "wrote": str(vcache)}
 
     if msg_type == "vendor-plan":
@@ -166,13 +229,22 @@ def handle(msg: dict) -> dict:
         if not isinstance(data, dict):
             return {"ok": False, "reason": "missing-data"}
         pcache = CACHE_DIR / f"vendor-{vendor}-plan-{pid}.json"
-        pcache.write_text(json.dumps({"vendor": vendor, "profile_id": pid, "data": data}))
+        try:
+            encoded = json.dumps(
+                {"vendor": vendor, "profile_id": pid, "data": data},
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "invalid-message"}
+        atomic_write_text(pcache, encoded)
         return {"ok": True, "wrote": str(pcache)}
 
     if msg_type == "vendor-status":
+        raw_ts = msg.get("fetched_at")
+        ts = "" if raw_ts is None else str(raw_ts)
         reason = msg.get("reason") or "unknown"
         vstatus = CACHE_DIR / f"vendor-{vendor}-{pid}.status"
-        vstatus.write_text(f"{msg.get('fetched_at', '')}\t{reason}")
+        atomic_write_text(vstatus, f"{ts}\t{reason}")
         return {"ok": True, "wrote": str(vstatus)}
 
     if msg_type == "vendor-clear":
@@ -188,9 +260,11 @@ def handle(msg: dict) -> dict:
             f"vendor-{vendor}-plan-{pid}.json",
         ]:
             p = CACHE_DIR / name
-            if p.exists():
+            try:
                 p.unlink()
                 removed.append(name)
+            except FileNotFoundError:
+                pass
         return {"ok": True, "removed": removed}
 
     return {"ok": False, "reason": "unknown-type"}
@@ -198,8 +272,12 @@ def handle(msg: dict) -> dict:
 
 def main() -> int:
     try:
-        msg = read_message()
-        if msg is None:
+        try:
+            msg = read_message()
+        except FrameError as error:
+            write_message({"ok": False, "reason": error.reason})
+            return 1
+        if msg is _EOF:
             return 0
         if not isinstance(msg, dict):
             write_message({"ok": False, "reason": "invalid-message"})
